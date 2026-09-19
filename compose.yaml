@@ -1,0 +1,22 @@
+# No web server or exposed ports are needed; SMTP and HTTPS are outbound only.
+services:
+  menu-mailer:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - delivery-data:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    pids_limit: 32
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+# This volume prevents repeat sends across container replacements and restarts.
+volumes:
+  delivery-data:

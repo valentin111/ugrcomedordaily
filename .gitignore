@@ -1,0 +1,8 @@
+# Keep mail credentials, delivery records and local Python files out of version control.
+.env
+.env.*
+!.env.example
+data/
+__pycache__/
+*.pyc
+.venv/

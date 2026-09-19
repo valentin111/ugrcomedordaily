@@ -1,0 +1,4 @@
+# Only the application is required inside the runtime image.
+*
+!app.py
+!Dockerfile
