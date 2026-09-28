@@ -23,6 +23,8 @@ import unicodedata
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+from dish_images import enabled_from_env, find_images
+
 
 SOURCE = "https://scu.ugr.es/"
 LOCATIONS = {"main": "Fuentenueva · Cartuja · Aynadamar", "pts": "PTS"}
@@ -30,7 +32,7 @@ MONTHS = dict(zip(
     "enero febrero marzo abril mayo junio julio agosto septiembre octubre noviembre diciembre".split(),
     range(1, 13),
 ))
-COURSES = {"primero": "Starter", "segundo": "Main", "acompanamiento": "Side", "postre": "Dessert"}
+COURSES = {"primero": "First course", "segundo": "Second course", "acompanamiento": "Side", "postre": "Dessert"}
 LOG = logging.getLogger("ugr-menu")
 
 
@@ -140,28 +142,68 @@ def fetch_page() -> str:
         return payload.decode(response.headers.get_content_charset() or "utf-8")
 
 
-def newsletter(day: date, menus: dict, location: str) -> tuple:
+def newsletter(day: date, menus: dict, location: str, images: dict = None) -> tuple:
     """Create concise plain-text and HTML versions with the original dish names."""
     title = f"UGR menu · {day:%d %b %Y}"
     campus = LOCATIONS[location]
     lines = [title, campus, ""]
     blocks = []
+    photo_credits = {}
     for option, dishes in menus.items():
-        lines.append(f"Menu {option}")
+        # Identify the vegetarian option consistently in text and HTML emails.
+        menu_label = f"Menu {option}" + (" · Vegetarian" if option == "2" else "")
+        lines.append(menu_label)
         rows = []
         for course, dish in dishes:
             lines.append(f"{COURSES[course]}: {dish}")
             rows.append(f"<div><strong>{COURSES[course]}:</strong> {escape(dish)}</div>")
+            photo = (images or {}).get(dish) if course in ("primero", "segundo") else None
+            if photo:
+                # Use linked thumbnails to keep emails small; all provider text is escaped.
+                rows.append(
+                    "<div style='margin:8px 0 16px'>"
+                    f"<a href='{escape(photo.source_url, quote=True)}'>"
+                    f"<img src='{escape(photo.url, quote=True)}' alt='{escape(dish, quote=True)}' "
+                    "width='288' height='192' style='display:block;width:100%;max-width:288px;"
+                    "height:192px;object-fit:cover;object-position:center;border:0'></a>"
+                    "</div>"
+                )
+                # Credit each photo once in the footer, even when both menus reuse it.
+                photo_credits[photo.source_url] = (
+                    f"<a href='{escape(photo.source_url, quote=True)}'>{escape(photo.title)}</a> — "
+                    f"{escape(photo.artist)}, {escape(photo.credit)} "
+                    f"(<a href='{escape(photo.license_url, quote=True)}'>{escape(photo.license_name)}</a>)"
+                )
         lines.append("")
-        blocks.append(f"<h2 style='font-size:18px;margin-bottom:8px'>Menu {option}</h2>" + "".join(rows))
+        # Inline-block columns wrap without CSS support; Outlook gets a fallback table.
+        blocks.append(
+            "<!--[if mso]><td width='320' valign='top'><![endif]-->"
+            "<div class='menu-column' style='display:inline-block;vertical-align:top;"
+            "width:100%;max-width:320px;box-sizing:border-box;padding:0 12px 0 0;font-size:16px'>"
+            f"<h2 style='font-size:18px;margin-bottom:8px'>{escape(menu_label)}</h2>"
+            + "".join(rows) + "</div><!--[if mso]></td><![endif]-->"
+        )
     lines.append(f"Full menu, allergens and updates: {SOURCE}")
+    # Keep credits in one compact paragraph that can wrap naturally on narrow screens.
+    footer = (
+        "<p style='font-size:10px;color:#666;line-height:1.4'>Imágenes orientativas (recortadas) · Wikimedia Commons · "
+        + " · ".join(photo_credits.values()) + "</p>"
+    ) if photo_credits else ""
     body = (
-        "<!doctype html><html lang='en'><meta charset='utf-8'><body "
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<style>@media screen and (max-width:687px){"
+        ".menu-column{display:block!important;max-width:100%!important;padding:0!important;}"
+        "}</style></head><body "
         "style='font-family:Arial,sans-serif;color:#222;line-height:1.6'>"
-        "<main style='max-width:600px;margin:auto;padding:24px'>"
+        "<main style='max-width:640px;margin:auto;padding:24px'>"
         f"<h1 style='font-size:24px;margin-bottom:0'>{escape(title)}</h1><p>{escape(campus)}</p>"
+        "<div style='font-size:0;text-align:left'>"
+        "<!--[if mso]><table role='presentation' width='640' cellpadding='0' cellspacing='0' border='0'><tr><![endif]-->"
         + "".join(blocks)
-        + f"<p><a href='{SOURCE}'>Full menu, allergens and updates</a></p></main></body></html>"
+        + "<!--[if mso]></tr></table><![endif]--></div>"
+        + f"<p><a href='{SOURCE}'>Full menu, allergens and updates</a></p>"
+        + footer + "</main></body></html>"
     )
     return title, "\n".join(lines), body
 
@@ -177,12 +219,14 @@ class Config:
     password: str
     sender: str
     recipients: tuple
+    test_recipients: tuple
     location: str
     timezone: ZoneInfo
     send_at: time
     retry_until: time
     retry_seconds: int
     state_path: Path
+    include_images: bool = True
 
     @classmethod
     def from_env(cls):
@@ -210,7 +254,11 @@ class Config:
         username = os.getenv("SMTP_USERNAME", "")
         if bool(username) != bool(password):
             raise ValueError("SMTP_USERNAME and SMTP_PASSWORD must both be set, or both omitted")
+        # Normal recipients are required; the separate test list can remain empty until needed.
         recipients = tuple(dict.fromkeys(address(x.strip()) for x in os.environ["RECIPIENTS"].split(",")))
+        test_recipients = tuple(dict.fromkeys(
+            address(value.strip()) for value in os.getenv("TEST_RECIPIENTS", "").split(",") if value.strip()
+        ))
         location = os.getenv("MENU_LOCATION", "main")
         if location not in LOCATIONS:
             raise ValueError("MENU_LOCATION must be main or pts")
@@ -222,8 +270,9 @@ class Config:
         if retry_seconds < 60:
             raise ValueError("RETRY_SECONDS must be at least 60")
         return cls(host, port, security, username, password, address(os.environ["MAIL_FROM"]),
-                   recipients, location, ZoneInfo(os.getenv("TZ", "Europe/Madrid")),
-                   send_at, retry_until, retry_seconds, Path(os.getenv("STATE_PATH", "data/delivery.sqlite3")))
+                   recipients, test_recipients, location, ZoneInfo(os.getenv("TZ", "Europe/Madrid")),
+                   send_at, retry_until, retry_seconds, Path(os.getenv("STATE_PATH", "data/delivery.sqlite3")),
+                   enabled_from_env())
 
 
 def send_email(config: Config, recipient: str, content: tuple):
@@ -284,7 +333,8 @@ def deliver(config: Config, day: date, connection) -> bool:
     if not menus:
         LOG.info("No menu published for %s; no email sent", day)
         return False
-    content = newsletter(day, menus, config.location)
+    images = find_images(menus) if config.include_images else {}
+    content = newsletter(day, menus, config.location, images)
     complete = True
     for index, recipient in enumerate(pending, 1):
         try:
@@ -302,6 +352,35 @@ def deliver(config: Config, day: date, connection) -> bool:
             connection.rollback()
             # Provider error messages can contain recipient addresses or credentials.
             LOG.error("Delivery failed for recipient %s/%s (%s); will retry", index, len(pending), type(error).__name__)
+            complete = False
+    return complete
+
+
+def send_test_email(config: Config, day: date) -> bool:
+    """Send today's menu only to test recipients without schedule or delivery-state checks."""
+    if not config.test_recipients:
+        LOG.error("TEST_RECIPIENTS is empty; no test email sent")
+        return False
+    menus = extract_menu(fetch_page(), day, config.location)
+    if not menus:
+        LOG.info("No menu published for %s; no test email sent", day)
+        return False
+    images = find_images(menus) if config.include_images else {}
+    subject, plain, html = newsletter(day, menus, config.location, images)
+    content = (
+        f"[TEST] {subject}",
+        f"TEST EMAIL — normal delivery records are unchanged.\n\n{plain}",
+        html.replace("<main ", "<div style='background:#fff3cd;padding:12px'>TEST EMAIL — normal delivery records are unchanged.</div><main ", 1),
+    )
+    complete = True
+    for index, recipient in enumerate(config.test_recipients, 1):
+        try:
+            send_email(config, recipient, content)
+            LOG.info("Test mail accepted for recipient %s/%s on %s", index, len(config.test_recipients), day)
+        except (OSError, smtplib.SMTPException) as error:
+            # Provider messages can contain addresses or credentials, so log only the error class.
+            LOG.error("Test delivery failed for recipient %s/%s (%s)",
+                      index, len(config.test_recipients), type(error).__name__)
             complete = False
     return complete
 
@@ -342,19 +421,24 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("run", help="Run the daily scheduler")
     commands.add_parser("once", help="Send today's menu now, honoring existing delivery records")
+    commands.add_parser("test-email", help="Send today's menu to TEST_RECIPIENTS without recording delivery")
     preview = commands.add_parser("preview", help="Print a menu without sending or needing SMTP settings")
     preview.add_argument("--date", type=date.fromisoformat)
     preview.add_argument("--file", type=Path, help="Read a saved UGR HTML page instead of the live site")
     preview.add_argument("--html", action="store_true", help="Print the HTML email instead of plain text")
+    preview.add_argument("--no-images", action="store_true", help="Skip live image searches in an HTML preview")
     preview.add_argument("--location", choices=LOCATIONS, default=os.getenv("MENU_LOCATION", "main"))
     args = parser.parse_args()
     if args.command == "preview":
         day = args.date or datetime.now(ZoneInfo(os.getenv("TZ", "Europe/Madrid"))).date()
         html = args.file.read_text(encoding="utf-8") if args.file else fetch_page()
         menus = extract_menu(html, day, args.location)
-        print(newsletter(day, menus, args.location)[2 if args.html else 1] if menus else f"No menu published for {day}.")
+        images = find_images(menus) if menus and args.html and not args.no_images and enabled_from_env() else {}
+        print(newsletter(day, menus, args.location, images)[2 if args.html else 1] if menus else f"No menu published for {day}.")
         return 0
     config = Config.from_env()
+    if args.command == "test-email":
+        return 0 if send_test_email(config, datetime.now(config.timezone).date()) else 1
     connection = open_state(config.state_path)
     try:
         if args.command == "once":

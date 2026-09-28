@@ -22,8 +22,8 @@ MONDAY = date(2026, 9, 21)
 def config(path):
     """Use fake SMTP details and an isolated state file for each delivery test."""
     return app.Config("smtp.example.com", 587, "starttls", "user", "password", "sender@example.com",
-                      ("one@example.com", "two@example.com"), "main", ZoneInfo("Europe/Madrid"),
-                      app.time(9), app.time(12), 900, path)
+                      ("one@example.com", "two@example.com"), (), "main", ZoneInfo("Europe/Madrid"),
+                      app.time(9), app.time(12), 900, path, include_images=False)
 
 
 class ParserTests(unittest.TestCase):
@@ -84,6 +84,13 @@ class ParserTests(unittest.TestCase):
         self.assertIn("Rice &lt;script&gt; &amp; peas", html)
         self.assertNotIn("<script>", html)
         self.assertIn(app.SOURCE, plain)
+
+    def test_second_menu_has_vegetarian_label_in_both_formats(self):
+        menus = app.extract_menu(self.html, MONDAY)
+        _, plain, html = app.newsletter(MONDAY, menus, "main")
+        self.assertIn("Menu 2 · Vegetarian", plain)
+        self.assertIn("Menu 2 · Vegetarian</h2>", html)
+        self.assertNotIn("Menu 1 · Vegetarian", plain + html)
 
 
 class DeliveryTests(unittest.TestCase):
@@ -147,6 +154,14 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, 3)
         self.assertEqual(self.send.call_args.args[1], "three@example.com")
 
+    def test_image_search_runs_once_for_all_recipients_and_skips_completed_day(self):
+        cfg = replace(self.config, include_images=True)
+        with patch("app.find_images", return_value={}) as search:
+            self.assertTrue(app.deliver(cfg, MONDAY, self.connection))
+            self.assertTrue(app.deliver(cfg, MONDAY, self.connection))
+            search.assert_called_once()
+        self.assertEqual(self.send.call_count, 2)
+
 
 class ScheduleTests(unittest.TestCase):
     """Check the daily window in Madrid through both daylight-saving transitions."""
@@ -174,6 +189,41 @@ class ScheduleTests(unittest.TestCase):
                                                       tzinfo=timezone.utc), self.config))
                 self.assertFalse(app.in_window(datetime(day.year, day.month, day.day, utc_hour - 1, 59,
                                                        tzinfo=timezone.utc), self.config))
+
+
+class TestEmailTests(unittest.TestCase):
+    """Keep test sends separate from production recipients, dates and delivery records."""
+
+    def setUp(self):
+        self.config = replace(config(Path("unused.sqlite3")),
+                              test_recipients=("test-one@example.com", "test-two@example.com"))
+        self.fetch = patch("app.fetch_page", return_value=FIXTURE.read_text(encoding="utf-8")).start()
+        self.send = patch("app.send_email").start()
+        self.addCleanup(patch.stopall)
+
+    def test_repeated_test_sends_ignore_schedule_and_delivery_history(self):
+        friday = date(2026, 9, 18)
+        self.assertTrue(app.send_test_email(self.config, friday))
+        self.assertTrue(app.send_test_email(self.config, friday))
+        recipients = [call.args[1] for call in self.send.call_args_list]
+        self.assertEqual(recipients, ["test-one@example.com", "test-two@example.com"] * 2)
+        self.assertTrue(all(call.args[2][0].startswith("[TEST]") for call in self.send.call_args_list))
+        self.assertNotIn("one@example.com", recipients)
+
+    def test_empty_test_list_sends_nothing(self):
+        self.assertFalse(app.send_test_email(replace(self.config, test_recipients=()), MONDAY))
+        self.fetch.assert_not_called()
+        self.send.assert_not_called()
+
+    def test_test_email_uses_image_search_without_opening_delivery_state(self):
+        cfg = replace(self.config, include_images=True)
+        with patch("app.find_images", return_value={}) as search, patch("app.open_state") as state:
+            with patch("app.Config.from_env", return_value=cfg), patch("sys.argv", ["app.py", "test-email"]), patch("app.datetime") as now:
+                now.now.return_value = datetime(2026, 9, 21, 15, tzinfo=cfg.timezone)
+                self.assertEqual(app.main(), 0)
+            search.assert_called_once()
+            state.assert_not_called()
+        self.assertEqual([call.args[1] for call in self.send.call_args_list], list(cfg.test_recipients))
 
 
 class MailTests(unittest.TestCase):
@@ -219,6 +269,7 @@ class ConfigurationTests(unittest.TestCase):
         with patch.dict(os.environ, self.env, clear=True):
             cfg = app.Config.from_env()
         self.assertEqual(cfg.recipients, ("one@example.com",))
+        self.assertEqual(cfg.test_recipients, ())
         self.assertEqual(str(cfg.timezone), "Europe/Madrid")
         self.assertEqual(cfg.send_at, app.time(9))
 
@@ -235,6 +286,11 @@ class ConfigurationTests(unittest.TestCase):
             secret.write_text("secret\n")
             with patch.dict(os.environ, {**self.env, "SMTP_USERNAME": "user", "SMTP_PASSWORD_FILE": str(secret)}, clear=True):
                 self.assertEqual(app.Config.from_env().password, "secret")
+
+    def test_test_recipients_are_optional_and_deduplicated(self):
+        env = {**self.env, "TEST_RECIPIENTS": "test@example.com,test@example.com"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(app.Config.from_env().test_recipients, ("test@example.com",))
 
 
 if __name__ == "__main__":
