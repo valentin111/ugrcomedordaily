@@ -15,8 +15,9 @@ from urllib.request import Request, urlopen
 
 
 API = "https://commons.wikimedia.org/w/api.php"
+TRANSLATION_API = "https://api.mymemory.translated.net/get"
 LOG = logging.getLogger("ugr-menu")
-STOP_WORDS = set("a al la las el los de del en con y un una para exclusivo personas celiaquia".split())
+STOP_WORDS = set("a al la las el los de del en con y un una para exclusivo personas celiaquia the an of with and in on to".split())
 FOOD_CONTEXT = re.compile(
     r"\b(?:dish(?:es)?|cuisine|cooked|cooking|fried|grilled|roasted|stew|soup|salad|meal|"
     r"paella|fideua|tortilla|hamburguesa|burger|croqueta|adobo|escabeche|plato|platos|"
@@ -57,7 +58,7 @@ def plain_text(value: str) -> str:
 
 
 def words(value: str) -> list:
-    """Match Spanish words without depending on accents or capitalization."""
+    """Match search words without depending on accents or capitalization."""
     value = unicodedata.normalize("NFKD", value.lower())
     return re.findall(r"[a-z]+", "".join(char for char in value if not unicodedata.combining(char)))
 
@@ -66,6 +67,58 @@ def search_terms(dish: str) -> list:
     """Retain ingredients and dietary labels while dropping connectors and celiac notes."""
     dish = re.sub(r"\([^)]*celiaqu[ií]a[^)]*\)", "", dish, flags=re.I)
     return list(dict.fromkeys(word for word in words(dish) if word not in STOP_WORDS))
+
+
+def translate_dish(dish: str, timeout: float) -> str:
+    """Translate only the public dish name through MyMemory's keyless lookup API."""
+    dish = re.sub(r"\([^)]*celiaqu[ií]a[^)]*\)", "", dish, flags=re.I).strip()
+    if not dish or len(dish.encode("utf-8")) > 500:
+        raise ValueError("Dish name exceeds the translation input limit")
+    request = Request(TRANSLATION_API + "?" + urlencode({"q": dish, "langpair": "es|en"}),
+                      headers={"Accept": "application/json", "User-Agent": "UGRComedorDaily/1.0"})
+    with urlopen(request, timeout=timeout) as response:
+        payload = response.read(100_001)
+        if len(payload) > 100_000:
+            raise ValueError("Translation response exceeds the expected size")
+        result = json.loads(payload)
+    if str(result.get("responseStatus")) != "200" or result.get("quotaFinished"):
+        raise ValueError("Translation service unavailable or quota exhausted")
+    translated = result.get("responseData", {}).get("translatedText")
+    if not isinstance(translated, str) or not translated.strip() or len(translated.encode("utf-8")) > 500:
+        raise ValueError("Translation service returned no usable dish name")
+    return plain_text(translated)
+
+
+def shorter_terms(terms: list) -> list:
+    """Keep dietary and preparation words so a bean burger cannot become bean paste."""
+    dietary = [word for word in terms if word.startswith(("vegetari", "vegan"))]
+    preparation = [word for word in terms if FOOD_CONTEXT.fullmatch(word)]
+    return list(dict.fromkeys(terms[:2] + dietary + preparation))
+
+
+def image_queries(dish: str, deadline: float):
+    """Try Spanish, then English, then shorter forms; translate only after a miss."""
+    spanish = search_terms(dish)
+    if not spanish:
+        return
+    yield spanish
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return
+    english = []
+    try:
+        english = search_terms(translate_dish(dish, min(5, remaining)))
+        # A translation must not silently lose a vegetarian or vegan restriction.
+        for prefix, qualifier in (("vegetari", "vegetarian"), ("vegan", "vegan")):
+            if any(word.startswith(prefix) for word in spanish) and qualifier not in english:
+                english.append(qualifier)
+    except Exception as error:
+        LOG.warning("Dish translation unavailable (%s); keeping Spanish image searches", type(error).__name__)
+    seen = {tuple(spanish)}
+    for query in (english, shorter_terms(spanish), shorter_terms(english)):
+        if query and tuple(query) not in seen:
+            seen.add(tuple(query))
+            yield query
 
 
 def enabled_from_env() -> bool:
@@ -154,17 +207,7 @@ def find_images(menus: dict) -> dict:
     deadline = time.monotonic() + 30
     # Normal menus have four dishes; allow extra PTS alternatives without unbounded calls.
     for dish in dishes[:8]:
-        terms = search_terms(dish)
-        if not terms:
-            continue
-        queries = [terms]
-        # A shorter search helps named house recipes, while retaining dietary qualifiers.
-        if len(terms) > 2:
-            dietary = [word for word in terms if word.startswith(("vegetari", "vegan"))]
-            simpler = list(dict.fromkeys(terms[:2] + dietary))
-            if simpler != terms:
-                queries.append(simpler)
-        for query in queries:
+        for query in image_queries(dish, deadline):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 LOG.info("Image search time budget reached; keeping remaining dishes text-only")

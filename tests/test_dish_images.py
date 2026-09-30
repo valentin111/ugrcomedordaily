@@ -94,6 +94,48 @@ class SelectionTests(unittest.TestCase):
         response.read.assert_called_once_with(1_000_001)
 
 
+class TranslationTests(unittest.TestCase):
+    """Validate translation responses before using them as search terms."""
+
+    def test_request_translates_only_the_dish_name(self):
+        response = MagicMock()
+        response.read.return_value = json.dumps({
+            "responseStatus": 200, "quotaFinished": False,
+            "responseData": {"translatedText": "<b>Vegetarian</b> paella"},
+        }).encode()
+        with patch("dish_images.urlopen") as fetch:
+            fetch.return_value.__enter__.return_value = response
+            translated = images.translate_dish("Paella Vegetariana (exclusivo para personas con celiaquía)", 3)
+        self.assertEqual(translated, "Vegetarian paella")
+        params = parse_qs(urlsplit(fetch.call_args.args[0].full_url).query)
+        self.assertEqual(params, {"q": ["Paella Vegetariana"], "langpair": ["es|en"]})
+        self.assertEqual(fetch.call_args.kwargs["timeout"], 3)
+        response.read.assert_called_once_with(100_001)
+
+    def test_invalid_or_exhausted_responses_are_rejected(self):
+        payloads = [
+            {"responseStatus": 429, "responseData": {"translatedText": "Quota exceeded"}},
+            {"responseStatus": 200, "quotaFinished": True, "responseData": {"translatedText": "Quota exceeded"}},
+            {"responseStatus": 200, "responseData": {"translatedText": ""}},
+            {"responseStatus": 200, "responseData": {"translatedText": None}},
+            {"responseStatus": 200, "responseData": {"translatedText": "x" * 501}},
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload), patch("dish_images.urlopen") as fetch:
+                fetch.return_value.__enter__.return_value.read.return_value = json.dumps(payload).encode()
+                with self.assertRaises(ValueError):
+                    images.translate_dish("Paella", 5)
+
+    def test_oversized_request_and_response_are_rejected(self):
+        with patch("dish_images.urlopen") as fetch:
+            with self.assertRaises(ValueError):
+                images.translate_dish("á" * 251, 5)
+            fetch.assert_not_called()
+            fetch.return_value.__enter__.return_value.read.return_value = b"x" * 100_001
+            with self.assertRaises(ValueError):
+                images.translate_dish("Paella", 5)
+
+
 class DiscoveryTests(unittest.TestCase):
     """Search fresh per batch, sharing matches across menus and recipients."""
 
@@ -102,19 +144,82 @@ class DiscoveryTests(unittest.TestCase):
                             ("acompanamiento", "Ensalada"), ("postre", "Melón")]}
 
     def test_unique_starters_and_mains_only_and_fresh_next_batch(self):
-        with patch("dish_images.search_commons", return_value=[result()]) as search:
+        with patch("dish_images.search_commons", return_value=[result()]) as search, \
+                patch("dish_images.translate_dish") as translate:
             self.assertEqual(list(images.find_images(self.menus)), ["Paella Mixta"])
             search.assert_called_once()
             images.find_images(self.menus)
             self.assertEqual(search.call_count, 2)
+            translate.assert_not_called()
 
     def test_house_name_fallback_retains_dietary_labels(self):
         menus = {"1": [("primero", "Paella Con Setas Al Buen Gusto Vegetariana")]}
-        with patch("dish_images.search_commons", return_value=[]) as search:
+        with patch("dish_images.search_commons", return_value=[]) as search, \
+                patch("dish_images.translate_dish", return_value="Vegetarian paella with mushrooms house style"):
             self.assertEqual(images.find_images(menus), {})
         queries = [call.args[0] for call in search.call_args_list]
-        self.assertEqual(len(queries), 2)
-        self.assertTrue(all("vegetariana" in query for query in queries))
+        self.assertEqual(len(queries), 4)
+        self.assertTrue(all("vegetariana" in query or "vegetarian" in query for query in queries))
+        self.assertEqual(queries[1], ["vegetarian", "paella", "mushrooms", "house", "style"])
+
+    def test_english_match_after_spanish_miss_is_shared_across_menus(self):
+        menus = {"1": [("primero", "Pollo Asado")], "2": [("segundo", "Pollo Asado")]}
+        page = result()
+        page["title"] = "File:Roasted chicken.jpg"
+        with patch("dish_images.search_commons", side_effect=[[], [page]]) as search, \
+                patch("dish_images.translate_dish", return_value="Roasted chicken") as translate:
+            found = images.find_images(menus)
+        self.assertEqual(found["Pollo Asado"].title, "Roasted chicken.jpg")
+        self.assertEqual([call.args[0] for call in search.call_args_list], [["pollo", "asado"], ["roasted", "chicken"]])
+        translate.assert_called_once()
+
+    def test_rejected_spanish_candidates_also_trigger_translation(self):
+        page = result()
+        page["imageinfo"][0]["extmetadata"]["LicenseUrl"]["value"] = ""
+        with patch("dish_images.search_commons", return_value=[page]), \
+                patch("dish_images.translate_dish", return_value="Mixed paella") as translate:
+            self.assertEqual(images.find_images(self.menus), {})
+        translate.assert_called_once()
+
+    def test_translation_failure_keeps_spanish_fallback_and_next_dish(self):
+        menus = {"1": [("primero", "Paella Mixta Especial"), ("segundo", "Paella Mixta")]}
+        with patch("dish_images.search_commons", side_effect=[[], [result()], [result()]]) as search, \
+                patch("dish_images.translate_dish", side_effect=TimeoutError()):
+            self.assertEqual(len(images.find_images(menus)), 2)
+        self.assertEqual([call.args[0] for call in search.call_args_list],
+                         [["paella", "mixta", "especial"], ["paella", "mixta"], ["paella", "mixta"]])
+
+    def test_translation_keeps_missing_dietary_qualifier_and_avoids_duplicate_queries(self):
+        with patch("dish_images.translate_dish", return_value="Paella"), \
+                patch("dish_images.time.monotonic", return_value=0):
+            queries = list(images.image_queries("Paella Vegetariana", 30))
+        self.assertEqual(queries, [["paella", "vegetariana"], ["paella", "vegetarian"]])
+        with patch("dish_images.translate_dish", return_value="Paella Mixta"), \
+                patch("dish_images.time.monotonic", return_value=0):
+            self.assertEqual(list(images.image_queries("Paella Mixta", 30)), [["paella", "mixta"]])
+
+    def test_short_english_query_does_not_drop_dish_type(self):
+        with patch("dish_images.translate_dish", return_value="Red bean burger house style"), \
+                patch("dish_images.time.monotonic", return_value=0):
+            queries = list(images.image_queries("Hamburguesa de alubias rojas", 30))
+        self.assertEqual(queries[-1], ["red", "bean", "burger"])
+        bean_paste = result()
+        bean_paste["title"] = "File:Red bean paste.jpg"
+        self.assertIsNone(images.select_image([bean_paste], queries[-1]))
+
+    def test_translation_and_english_search_share_time_budget(self):
+        with patch("dish_images.time.monotonic", side_effect=[0, 0, 31]), \
+                patch("dish_images.search_commons", return_value=[]) as search, \
+                patch("dish_images.translate_dish") as translate:
+            self.assertEqual(images.find_images(self.menus), {})
+            translate.assert_not_called()
+            search.assert_called_once()
+        with patch("dish_images.time.monotonic", side_effect=[0, 0, 28, 31]), \
+                patch("dish_images.search_commons", return_value=[]) as search, \
+                patch("dish_images.translate_dish", return_value="Mixed paella") as translate:
+            self.assertEqual(images.find_images(self.menus), {})
+            translate.assert_called_once_with("Paella Mixta", 2)
+            search.assert_called_once()
 
     def test_unavailable_service_does_not_block_newsletter(self):
         for error in (TimeoutError(), ValueError(), HTTPError(images.API, 429, "Rate limited", {}, None)):
